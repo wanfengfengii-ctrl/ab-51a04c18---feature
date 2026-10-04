@@ -2,26 +2,39 @@
 
 从滚环扩增（RCA）产生的串联条码读段中，在插入、缺失和替换噪声下恢复共同切点。
 
-联合选择：参考序列的一个**循环移位**、恰好 `copies` 个覆盖整条读段的**连续非空分段**，
-以及每段的一次**全局比对**（Needleman–Wunsch，M/D/I 单碱基代价均为 1），按
+联合选择：参考序列的一个**方向**（正向或其反向互补）与**循环移位**、恰好 `copies` 个
+覆盖整条读段的**连续非空分段**，以及每段的一次**全局比对**（Needleman–Wunsch，M/D/I
+单碱基代价均为 1），按
 
 1. 总编辑数（`total_edits`）
 2. 单段最大编辑数（`max_segment_edits`）
 
-字典序最小化；最优解释按 `(shift, boundaries, CIGAR)` 稳定排序。
+字典序最小化；最优解释按 `(strand, shift, boundaries, CIGAR)` 稳定排序。
 
-- 唯一最优 → `unique`：唯一移位、各段边界、编辑数、CIGAR 及可回放对齐双行串。
+请求可选 `strand_mode`：
+
+- 省略：与旧版完全一致——仅按提交的参考序列（正向）解码，响应不含任何 strand 字段。
+- `"forward"` / `"reverse"`：分别以参考序列或其**反向互补序列**参与原共同切点解码。
+- `"auto"`：在两个方向的全部可行解释间沿用原两级目标裁决；两个方向同优时返回
+  `ambiguous`，绝不偏向先计算的方向。
+
+每份见证带 `strand`（`forward`/`reverse`），`shift` 相对于**该方向**的参考序列；
+边界仍用所提交读段的坐标；响应中的 `rotated_reference` 是定向后的循环移位参考，
+CIGAR 可直接由它与读段片段回放。方向已确定返回 `unique`，方向不确定返回
+`ambiguous`，两个方向都无法解释时沿用可定位的约束失败（422）。
+
+- 唯一最优 → `unique`：唯一方向与移位、各段边界、编辑数、CIGAR 及可回放对齐双行串。
 - 多个最优 → `ambiguous`：返回稳定排序后的前两份见证及 `more_witnesses`。
 - 无可行解释 → HTTP 422 `constraint_failed`，区分
   `segment_length`（结构性长度不可能）与 `per_segment_edit_budget`（预算超限），
-  后者给出无预算下最近分段及每个超限分段的位置、所需编辑数与超出量。
+  单方向失败时给出无预算下最近分段及每个超限分段的位置、所需编辑数与超出量。
 
 ## 目录
 
 ```
 app/solver.py     核心算法：带限 NW + 全最优 CIGAR 枚举、前后缀分段 DP、见证重建、失败诊断
 app/main.py       FastAPI 服务：POST /api/concatemers/decode 与 /health
-tests/            35 个测试，含与穷举参考实现的一致性校验
+tests/            测试套件，含单向与双向穷举参考实现的一致性校验
 scripts/verify.py 一次性校验：等健康 → pytest → 构建自检 → 含插/缺/替的实时解码冒烟
 Dockerfile        python:3.11-slim，内置容器健康检查
 docker-compose.yml 可配置宿主机端口；verify 一次性服务（依赖 api 健康后启动）
@@ -52,7 +65,9 @@ echo $?      # 0 通过，非 0 失败
 2. 在容器内执行全部代码测试（pytest）；
 3. 构建自检（依赖版本、应用可导入、路由数）；
 4. 对**运行中的 API** 发起解码冒烟，覆盖同一请求中的替换、缺失与插入，
-   并额外核对 unique / ambiguous / infeasible 三种响应。
+   并额外核对 unique / ambiguous / infeasible 三种响应；
+5. 链方向冒烟：反向解码（定向参考与回放）、`auto` 唯一裁决、
+   跨方向同优歧义（稳定排序）及两方向均失败时的可定位 422。
 
 ## 请求示例
 
@@ -101,6 +116,31 @@ curl -s -X POST http://localhost:8000/api/concatemers/decode \
   "more_witnesses": true
 }
 ```
+
+## 链方向（`strand_mode`）
+
+双链文库的串联条码可能来自参考链或其反向互补链。质控时可直接指定方向，或用
+`auto` 一次裁决，避免先试一个方向再试另一个、并把跨方向的同优结果错误合并：
+
+```bash
+curl -s -X POST http://localhost:8000/api/concatemers/decode \
+  -H 'Content-Type: application/json' \
+ -d '{
+       "reference": "ACGTACGATC",
+       "read": "GTACGTGATCGTACGTGATCGTACGTGATC",
+       "copies": 3,
+       "max_edits": 1,
+       "strand_mode": "auto"
+     }'
+```
+
+- `unique`：方向已唯一确定，见证的 `strand` 标明方向，`shift` 相对该方向的参考。
+- `ambiguous`：方向不确定（两个方向同优）或同方向内存在多解；见证按
+  `(strand, shift, boundaries, CIGAR)` 稳定排列，前两份为 `forward` 在前、
+  `reverse` 在后。
+- 422 `constraint_failed`：两个方向都无法解释读段；调用方据此区分
+  “方向已确定 / 方向不确定 / 读段本身无法解释”。
+- 非法模式（如 `"backwards"`）按字段在 `strand_mode` 上返回 422 校验错误。
 
 ## 本地开发（无 Docker）
 

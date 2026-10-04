@@ -8,7 +8,9 @@ It performs, in order, exiting non-zero on the first failure:
 3. sanity-check the running build (importable app + dependency versions),
 4. run a decode smoke test against the live API that exercises
    insertions, deletions and substitutions together, plus unique,
-   ambiguous and infeasible responses.
+   ambiguous and infeasible responses,
+5. run strand-mode smokes: reverse-direction decode, joint ``auto``
+   direction resolution and cross-direction ambiguity.
 """
 
 from __future__ import annotations
@@ -28,6 +30,16 @@ DECODE_URL = f"{API}/api/concatemers/decode"
 # Repository root (this file lives in <root>/scripts/verify.py).  In the
 # image the tree is copied under /srv, so the same derivation holds there.
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+_COMPLEMENT = str.maketrans("ACGT", "TGCA")
+
+
+def reverse_complement(sequence: str) -> str:
+    return sequence.translate(_COMPLEMENT)[::-1]
+
+
+def rotate(sequence: str, shift: int) -> str:
+    return sequence[shift:] + sequence[:shift]
 
 
 def step(title: str) -> None:
@@ -189,6 +201,131 @@ def smoke_decode() -> bool:
     return True
 
 
+def smoke_strands() -> bool:
+    step("strand-mode smoke (reverse decode, auto resolve, cross ambiguity)")
+    ref = "ACGTACGATC"
+
+    # Reverse direction: the read is tandem copies of the reverse-complement
+    # reference rotated to cut point 4.  shift must be relative to the
+    # reverse-direction reference and CIGAR must replay against the
+    # oriented rotated reference handed back in the response.
+    oriented = rotate(reverse_complement(ref), 4)
+    status, data = post(
+        {
+            "reference": ref,
+            "read": oriented * 3,
+            "copies": 3,
+            "max_edits": 0,
+            "strand_mode": "reverse",
+        }
+    )
+    print("reverse status:", status)
+    if status != 200 or data["status"] != "unique":
+        print("FAIL: reverse decode expected HTTP 200 unique", status)
+        return False
+    witness = data["witness"]
+    if witness["strand"] != "reverse" or witness["shift"] != 4:
+        print("FAIL: reverse witness mislabelled", witness.get("strand"),
+              witness.get("shift"))
+        return False
+    if data["rotated_reference"] != oriented:
+        print("FAIL: reverse oriented reference mismatch")
+        return False
+    for seg in witness["segments"]:
+        if seg["aligned_reference"].replace("-", "") != oriented:
+            print("FAIL: reverse reference replay mismatch")
+            return False
+        if seg["aligned_read"].replace("-", "") != seg["read"]:
+            print("FAIL: reverse read replay mismatch")
+            return False
+    # Forward alone cannot explain the reverse read.
+    status, data = post(
+        {
+            "reference": ref,
+            "read": oriented * 3,
+            "copies": 3,
+            "max_edits": 0,
+            "strand_mode": "forward",
+        }
+    )
+    if status != 422 or data.get("status") != "infeasible":
+        print("FAIL: forward should reject the reverse read", status)
+        return False
+    print("reverse case passed (oriented reference, shift and replay)")
+
+    # auto resolves the direction without the caller probing twice.
+    status, data = post(
+        {
+            "reference": ref,
+            "read": oriented * 3,
+            "copies": 3,
+            "max_edits": 0,
+            "strand_mode": "auto",
+        }
+    )
+    if (
+        status != 200
+        or data["status"] != "unique"
+        or data["witness"]["strand"] != "reverse"
+    ):
+        print("FAIL: auto should uniquely resolve to reverse", status,
+              data.get("status"))
+        return False
+    print("auto case passed (direction uniquely resolved)")
+
+    # Cross-direction tie: a reference equal to its own reverse complement
+    # makes both directions equally optimal; auto must report ambiguity and
+    # order witnesses by (strand, shift, boundaries, CIGAR).
+    pal = "ACGATATCGT"
+    assert reverse_complement(pal) == pal
+    status, data = post(
+        {
+            "reference": pal,
+            "read": pal * 3,
+            "copies": 3,
+            "max_edits": 0,
+            "strand_mode": "auto",
+        }
+    )
+    if (
+        status != 200
+        or data["status"] != "ambiguous"
+        or len(data["witnesses"]) != 2
+    ):
+        print("FAIL: cross-direction tie must be ambiguous", status,
+              data.get("status"))
+        return False
+    w0, w1 = data["witnesses"]
+    if (w0["strand"], w1["strand"]) != ("forward", "reverse"):
+        print("FAIL: cross-direction witnesses misordered",
+              w0.get("strand"), w1.get("strand"))
+        return False
+    if (w0["shift"], w0["boundaries"]) > (w1["shift"], w1["boundaries"]):
+        print("FAIL: witnesses not in stable (shift, boundaries) order")
+        return False
+    print("cross-direction ambiguity case passed (both strands, stable order)")
+
+    # auto with both directions impossible stays a locatable constraint
+    # failure so callers can tell "read unexplainable" from ambiguity.
+    status, data = post(
+        {
+            "reference": ref,
+            "read": "TTGTACGATC" + "G" * 10 + "C" * 10,
+            "copies": 3,
+            "max_edits": 1,
+            "strand_mode": "auto",
+        }
+    )
+    if status != 422 or data.get("status") != "infeasible":
+        print("FAIL: both-direction infeasible must be 422 infeasible", status)
+        return False
+    if data.get("constraint", {}).get("name") != "per_segment_edit_budget":
+        print("FAIL: both-direction failure must stay locatable")
+        return False
+    print("both-infeasible case passed (locatable constraint failure)")
+    return True
+
+
 def main() -> int:
     if not wait_for_health():
         return 1
@@ -197,6 +334,8 @@ def main() -> int:
     if not check_build():
         return 1
     if not smoke_decode():
+        return 1
+    if not smoke_strands():
         return 1
     print("\n=== verify: ALL CHECKS PASSED ===")
     return 0

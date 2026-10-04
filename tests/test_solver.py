@@ -4,7 +4,13 @@ import itertools
 
 import pytest
 
-from app.solver import align_global, rotate, solve, _replay
+from app.solver import (
+    align_global,
+    reverse_complement,
+    rotate,
+    solve,
+    _replay,
+)
 
 
 # ---------------------------------------------------------------- alignments
@@ -290,3 +296,222 @@ def test_matches_brute_force(reference, read, copies, cap):
         for g in got:
             assert g in bf_sorted
         assert got[0][0] <= got[1][0]
+
+
+# ------------------------------------------------------------- strand modes
+
+
+def test_reverse_complement_helper():
+    assert reverse_complement("ACGT") == "ACGT"
+    assert reverse_complement("ACGTACGATC") == "GATCGTACGT"
+    assert reverse_complement(reverse_complement("ACGTACGATC")) == "ACGTACGATC"
+
+
+def test_reverse_mode_decodes_against_reverse_complement():
+    ref = "ACGTACGATC"
+    rcref = reverse_complement(ref)
+    rot = rotate(rcref, 4)
+    read = rot * 3
+    r = solve(ref, read, 3, 0, "reverse")
+    assert r["status"] == "unique"
+    w = r["witness"]
+    assert w["strand"] == "reverse"
+    assert w["shift"] == 4
+    assert w["boundaries"] == [[0, 10], [10, 20], [20, 30]]
+    # Every segment carries the reverse-direction oriented reference and the
+    # shift is relative to that direction's reference.
+    assert all(s["reference"] == rot and s["cigar"] == "10M" for s in w["segments"])
+    # Boundaries stay in submitted-read coordinates.
+    assert all(s["read"] == read[s["start"]:s["end"]] for s in w["segments"])
+
+
+def test_reverse_mode_is_infeasible_when_read_is_forward():
+    ref = "ACGTACGATC"
+    r = solve(ref, ref * 3, 3, 0, "reverse")
+    assert r["status"] == "infeasible"
+    assert r["error"] == "constraint_failed"
+    assert r["nearest"]["strand"] == "reverse"
+
+
+def test_auto_selects_direction():
+    ref = "ACGTACGATC"
+    # Reverse-only read: auto must not keep the forward attempt.
+    rrev = solve(ref, rotate(reverse_complement(ref), 4) * 3, 3, 0, "auto")
+    assert rrev["status"] == "unique"
+    assert rrev["witness"]["strand"] == "reverse"
+    # Forward-only read.
+    rfwd = solve(ref, ref * 3, 3, 0, "auto")
+    assert rfwd["status"] == "unique"
+    assert rfwd["witness"]["strand"] == "forward"
+
+
+def test_auto_does_not_favour_calculation_order():
+    # A reference equal to its own reverse complement makes both directions
+    # offer the identical optimal explanation: auto must flag ambiguity
+    # rather than silently returning the forward one.
+    ref = "ACGATATCGT"
+    assert reverse_complement(ref) == ref
+    r = solve(ref, ref * 3, 3, 0, "auto")
+    assert r["status"] == "ambiguous"
+    assert r["more_witnesses"] is False
+    w0, w1 = r["witnesses"]
+    assert w0["strand"] == "forward" and w1["strand"] == "reverse"
+    # The two directions share shift, boundaries and CIGARs ...
+    assert w0["shift"] == w1["shift"] == 0
+    assert w0["boundaries"] == w1["boundaries"]
+    assert [s["cigar"] for s in w0["segments"]] == [
+        s["cigar"] for s in w1["segments"]
+    ]
+    # ... and the stable ordering is (strand, shift, boundaries, CIGAR).
+    assert _witness_strand_key(w0) <= _witness_strand_key(w1)
+
+
+def test_auto_does_not_favour_calculation_order_with_noise():
+    # Same palindromic reference with one edit per copy: both directions
+    # remain tied and the cross-direction ambiguity survives noise.
+    ref = "ACGATATCGT"
+    read = "ATGATATCGT" + "ACGATATCG" + "ACGATATCGTA"  # sub/del/ins, 30 nt
+    assert len(read) == 30
+    r = solve(ref, read, 3, 1, "auto")
+    assert r["status"] == "ambiguous"
+    strands = [w["strand"] for w in r["witnesses"]]
+    assert strands == ["forward", "reverse"]
+
+
+def test_cross_direction_witnesses_stably_ordered():
+    # Homopolymer reference: every shift is optimal in both directions; the
+    # returned pair must lead with the smallest forward witness.
+    r = solve("AAAAAAAA", "A" * 24, 3, 0, "auto")
+    assert r["status"] == "ambiguous"
+    w0, w1 = r["witnesses"]
+    assert w0["strand"] == "forward"
+    assert w0["shift"] < w1["shift"] or (
+        w0["shift"] == w1["shift"] and w0["boundaries"] <= w1["boundaries"]
+    )
+    keys = [_witness_strand_key(w) for w in r["witnesses"]]
+    assert keys == sorted(keys)
+    # Eight forward shifts + eight reverse shifts share the same optimum.
+    assert r["more_witnesses"] is True
+
+
+def test_auto_both_infeasible_is_locatable_constraint_failure():
+    ref = "ACGTACGATC"
+    garbage = "TTGTACGATC" + "G" * 10 + "C" * 10
+    r = solve(ref, garbage, 3, 1, "auto")
+    assert r["status"] == "infeasible"
+    assert r["error"] == "constraint_failed"
+    # Same locatable constraint block as a single direction ...
+    assert r["constraint"]["name"] == "per_segment_edit_budget"
+    # ... but no direction-specific nearest witness can be honestly attached
+    # when both directions fail.
+    assert r["nearest"] is None
+
+
+def test_auto_structural_failure_in_both_directions():
+    ref = "ACGTACGT"
+    r = solve(ref, "A" * 160, 3, 3, "auto")
+    assert r["status"] == "infeasible"
+    assert r["constraint"]["name"] == "segment_length"
+    assert r["nearest"] is None
+
+
+def test_invalid_strand_mode_rejected_at_solver():
+    with pytest.raises(ValueError):
+        solve("ACGTACGATC", "A" * 30, 3, 0, "sideways")
+
+
+def _witness_strand_key(w):
+    return (
+        w["strand"],
+        w["shift"],
+        tuple(tuple(b) for b in w["boundaries"]),
+        tuple(s["cigar"] for s in w["segments"]),
+    )
+
+
+def _brute_force_stranded(reference, read, copies, cap):
+    """Exhaustive reference over both orientations, shifts and partitions."""
+    n = len(read)
+    solutions = []
+    best = None
+    for strand in ("forward", "reverse"):
+        oriented = (
+            reference if strand == "forward" else reverse_complement(reference)
+        )
+        for shift in range(len(oriented)):
+            ref = rotate(oriented, shift)
+            for cuts in itertools.combinations(range(1, n), copies - 1):
+                bounds = (0,) + cuts + (n,)
+                total = 0
+                worst = 0
+                seg_cigars = []
+                ok = True
+                for a, b in zip(bounds, bounds[1:]):
+                    aligned = align_global(ref, read[a:b], cap)
+                    if aligned is None:
+                        ok = False
+                        break
+                    dist, cigs = aligned
+                    total += dist
+                    worst = max(worst, dist)
+                    seg_cigars.append(cigs)
+                if not ok:
+                    continue
+                for combo in itertools.product(*seg_cigars):
+                    cand = (
+                        (total, worst),
+                        strand,
+                        shift,
+                        list(zip(bounds, bounds[1:])),
+                        combo,
+                    )
+                    if best is None or cand[0] < best:
+                        best = cand[0]
+                        solutions = [cand]
+                    elif cand[0] == best:
+                        solutions.append(cand)
+    if best is None:
+        return None
+    return best, solutions
+
+
+@pytest.mark.parametrize(
+    "reference,read,copies,cap",
+    [
+        ("ACGTACGT", "ACGTACGTACGTACGT", 3, 0),
+        ("ACGTACGATC", rotate(reverse_complement("ACGTACGATC"), 4) * 3, 3, 0),
+        ("ACGATATCGT", "ACGATATCGT" * 3, 3, 0),
+        ("ACGTTGCA", "ACXTTGCAAACGTTGCAACGTTGCA", 3, 2),
+        ("ACGTACGT", "TACGTACGTACGTACGTA", 4, 1),
+        ("AAAAAAAA", "A" * 24, 3, 0),
+    ],
+)
+def test_auto_matches_two_direction_brute_force(reference, read, copies, cap):
+    r = solve(reference, read, copies, cap, "auto")
+    bf = _brute_force_stranded(reference, read, copies, cap)
+    if bf is None:
+        assert r["status"] == "infeasible"
+        return
+    (total, worst), sols = bf
+    assert r["status"] in ("unique", "ambiguous")
+    assert r["objective"] == {"total_edits": total, "max_segment_edits": worst}
+
+    bf_sorted = sorted(
+        (
+            (strand, shift, tuple((a, b) for a, b in bounds), tuple(combo))
+            for _, strand, shift, bounds, combo in sols
+        )
+    )
+    if r["status"] == "unique":
+        got = [_witness_strand_key(r["witness"])]
+    else:
+        got = [_witness_strand_key(w) for w in r["witnesses"]]
+    for g in got:
+        assert g in bf_sorted
+    assert got == sorted(got)
+    if len(bf_sorted) == 1:
+        assert r["status"] == "unique"
+        assert got[0] == bf_sorted[0]
+    else:
+        assert r["status"] == "ambiguous"
+        assert len(got) == 2
