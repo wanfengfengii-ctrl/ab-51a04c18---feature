@@ -3,20 +3,24 @@
 Given a circular reference, a noisy tandem-read, a copy number ``k`` and a
 per-copy edit budget ``cap``, jointly choose:
 
-1. a cyclic shift (rotation) of the reference,
+1. a strand (forward reference or its reverse complement) and a cyclic shift
+   (rotation) of that strand's reference,
 2. exactly ``k`` consecutive, non-empty segments covering the whole read,
 3. a global (Needleman-Wunsch, unit indel/sub cost) alignment for every
    segment,
 
 so that total edit count is minimized, ties broken by the maximum edit count
 of any single segment.  Witnesses are stably ordered by
-``(shift, boundaries, cigars)``.
+``(shift, boundaries, cigars)`` within one strand, or
+``(strand, shift, boundaries, cigars)`` when both strands are considered.
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
+
+StrandMode = Literal["forward", "reverse", "auto"]
 
 # Safety bound on the number of distinct optimal CIGARs enumerated for one
 # (reference, read) pair.  With edit distance <= 3 and lengths <= 20 + 3 this
@@ -25,6 +29,11 @@ _CIGAR_ENUM_LIMIT = 20_000
 
 # Sam-style op rank used only for deterministic traversal.
 _OP_RANK = {"M": 0, "D": 1, "I": 2}
+
+# Direction rank for stable cross-strand ordering (forward sorts first).
+_STRAND_RANK = {"forward": 0, "reverse": 1}
+
+_COMPLEMENT = str.maketrans("ACGT", "TGCA")
 
 
 def _build_cigar(steps: str) -> str:
@@ -135,68 +144,111 @@ def rotate(reference: str, shift: int) -> str:
     return reference[shift:] + reference[:shift]
 
 
+def reverse_complement(reference: str) -> str:
+    """Reverse complement of a DNA string already normalized to A/C/G/T."""
+    return reference.translate(_COMPLEMENT)[::-1]
+
+
 def _witness_key(witness: dict) -> Tuple:
     return (
+        _STRAND_RANK[witness["strand"]],
         witness["shift"],
         tuple((s["start"], s["end"]) for s in witness["segments"]),
         tuple(_cigar_sort_key(s["cigar"]) for s in witness["segments"]),
     )
 
 
-def solve(reference: str, read: str, copies: int, max_edits: int) -> dict:
+def solve(
+    reference: str,
+    read: str,
+    copies: int,
+    max_edits: int,
+    strand_mode: StrandMode = "forward",
+) -> dict:
     """Run the full joint optimization.
+
+    ``strand_mode`` selects which reference orientations participate:
+
+    * ``"forward"`` (default) - the submitted reference only, preserving the
+      original request/response/failure behaviour,
+    * ``"reverse"`` - the reverse complement of the reference only,
+    * ``"auto"`` - both orientations jointly; the same two-level objective
+      decides across the pooled candidates, so the first-computed direction is
+      never privileged and an equal optimum across directions is ambiguous.
 
     Returns a result envelope with ``status`` of ``unique`` / ``ambiguous`` /
     ``infeasible``.
     """
+    if strand_mode == "forward":
+        strands = [("forward", reference)]
+    elif strand_mode == "reverse":
+        strands = [("reverse", reverse_complement(reference))]
+    elif strand_mode == "auto":
+        strands = [("forward", reference), ("reverse", reverse_complement(reference))]
+    else:  # pragma: no cover - rejected at the API boundary
+        raise ValueError(f"invalid strand_mode: {strand_mode!r}")
+
     length = len(reference)
     n = len(read)
     min_seg_len = max(1, length - max_edits)
     max_seg_len = length + max_edits
 
-    # Per-shift optimum (total_edits, max_segment_edits); None == infeasible.
-    shift_best: List[Optional[Tuple[int, int]]] = []
-    shift_tables: List[Optional[tuple]] = []
+    # Per strand: (name, oriented_reference, per-shift optimum, per-shift
+    # tables).  A None optimum marks that rotation infeasible.
+    per_strand: List[Tuple[str, str, List[Optional[Tuple[int, int]]], List]] = []
+    for strand, strand_ref in strands:
+        shift_best: List[Optional[Tuple[int, int]]] = []
+        shift_tables: List[Optional[tuple]] = []
+        for shift in range(length):
+            ref = rotate(strand_ref, shift)
+            pre, suff = _build_tables(
+                ref, read, copies, max_edits, min_seg_len, max_seg_len
+            )
+            shift_best.append(pre[copies].get(n))
+            shift_tables.append((pre, suff))
+        per_strand.append((strand, strand_ref, shift_best, shift_tables))
 
-    for shift in range(length):
-        ref = rotate(reference, shift)
-        pre, suff = _build_tables(
-            ref, read, copies, max_edits, min_seg_len, max_seg_len
-        )
-        shift_best.append(pre[copies].get(n))
-        shift_tables.append((pre, suff))
-
-    feasible = [b for b in shift_best if b is not None]
+    feasible = [
+        best for _, _, shift_best, _ in per_strand for best in shift_best
+        if best is not None
+    ]
     if not feasible:
         return _infeasible_envelope(
-            reference, read, copies, max_edits, shift_best, shift_tables
+            reference,
+            read,
+            copies,
+            max_edits,
+            strand_mode,
+            per_strand,
         )
 
     optimum = min(feasible)
 
-    # Recover up to three smallest witnesses per optimal shift.  Three is
-    # enough to return the first two while knowing whether more exist; the
-    # shift is the leading sort key.
+    # Recover up to three smallest witnesses per optimal (strand, shift).
+    # Three is enough to return the first two while knowing whether more
+    # exist; (strand, shift) is the leading sort key.
     candidates: List[dict] = []
-    for shift, best in enumerate(shift_best):
-        if best != optimum:
-            continue
-        ref = rotate(reference, shift)
-        pre, suff = shift_tables[shift]
-        witnesses = _recover_witnesses(
-            shift,
-            ref,
-            read,
-            copies,
-            max_edits,
-            min_seg_len,
-            max_seg_len,
-            pre,
-            suff,
-            optimum,
-            limit=3,
-        )
-        candidates.extend(witnesses)
+    for strand, strand_ref, shift_best, shift_tables in per_strand:
+        for shift, best in enumerate(shift_best):
+            if best != optimum:
+                continue
+            ref = rotate(strand_ref, shift)
+            pre, suff = shift_tables[shift]
+            witnesses = _recover_witnesses(
+                strand,
+                shift,
+                ref,
+                read,
+                copies,
+                max_edits,
+                min_seg_len,
+                max_seg_len,
+                pre,
+                suff,
+                optimum,
+                limit=3,
+            )
+            candidates.extend(witnesses)
 
     candidates.sort(key=_witness_key)
     objective = {"total_edits": optimum[0], "max_segment_edits": optimum[1]}
@@ -273,6 +325,7 @@ def _build_tables(
 
 
 def _recover_witnesses(
+    strand: str,
     shift: int,
     ref: str,
     read: str,
@@ -299,7 +352,7 @@ def _recover_witnesses(
             return
         if seg == copies:
             if p == n and (total, worst) == optimum:
-                found.append(_build_witness(shift, ref, read, chosen))
+                found.append(_build_witness(strand, shift, ref, read, chosen))
             return
         remaining_after = copies - seg - 1
         lo = max(min_len, n - p - remaining_after * max_len)
@@ -449,7 +502,7 @@ def _replay(ref: str, piece: str, cigar: str) -> dict:
     }
 
 
-def _build_witness(shift: int, ref: str, read: str, chosen) -> dict:
+def _build_witness(strand: str, shift: int, ref: str, read: str, chosen) -> dict:
     segments = []
     for start, end, edits, cigar in chosen:
         piece = read[start:end]
@@ -464,6 +517,7 @@ def _build_witness(shift: int, ref: str, read: str, chosen) -> dict:
         segment.update(_replay(ref, piece, cigar))
         segments.append(segment)
     return {
+        "strand": strand,
         "shift": shift,
         "boundaries": [[s["start"], s["end"]] for s in segments],
         "segments": segments,
@@ -475,38 +529,45 @@ def _infeasible_envelope(
     read: str,
     copies: int,
     max_edits: int,
-    shift_best: List[Optional[Tuple[int, int]]],
-    shift_tables: List[Optional[tuple]],
+    strand_mode: StrandMode,
+    per_strand: List[Tuple[str, str, List[Optional[Tuple[int, int]]], List]],
 ) -> dict:
     """Build a locatable constraint-failure envelope.
 
     The failure is always the per-segment edit budget.  To localize it we
-    compute, per rotation, the edit distance from the reference to *every*
-    read substring in one band-free DP per start position, then run a single
-    segmentation DP without any per-segment cap.  That yields the globally
-    nearest witness; the segments exceeding the requested budget are reported
-    with the edit counts they actually needed.
+    compute, per strand and rotation, the edit distance from the oriented
+    reference to *every* read substring in one band-free DP per start
+    position, then run a single segmentation DP without any per-segment cap.
+    That yields the globally nearest witness; the segments exceeding the
+    requested budget are reported with the edit counts they actually needed.
     """
     length = len(reference)
     n = len(read)
     min_total = copies * max(1, length - max_edits)
     max_total = copies * (length + max_edits)
     # Structural bounds ignoring the edit budget: k non-empty global
-    # alignments can cover any per-segment length from 1 to 2L.
+    # alignments can cover any per-segment length from 1 to 2L.  Orientation
+    # does not change length, so this is strand-independent.
     structurally_possible = copies <= n <= copies * 2 * length
 
-    best = None  # (cost, shift, boundaries)
+    best = None  # (cost, strand, shift, boundaries)
     if structurally_possible:
-        for shift in range(length):
-            ref = rotate(reference, shift)
-            found = _diagnose_shift(ref, read, copies, length)
-            if found is not None and (best is None or found[0] < best[0]):
-                best = (found[0], shift, found[1])
+        for strand, strand_ref, _, _ in per_strand:
+            for shift in range(length):
+                ref = rotate(strand_ref, shift)
+                found = _diagnose_shift(ref, read, copies, length)
+                if found is not None and (
+                    best is None or found[0] < best[0]
+                ):
+                    best = (found[0], strand, shift, found[1])
 
     nearest = None
     if best is not None:
-        cost, shift, boundaries = best
-        ref = rotate(reference, shift)
+        cost, strand, shift, boundaries = best
+        strand_ref = dict(
+            (name, oriented) for name, oriented, _, _ in per_strand
+        )[strand]
+        ref = rotate(strand_ref, shift)
         segments = []
         violating = []
         for idx, (start, end) in enumerate(boundaries):
@@ -528,8 +589,9 @@ def _infeasible_envelope(
                         "cigar": cigar,
                     }
                 )
-        witness = _build_witness(shift, ref, read, segments)
+        witness = _build_witness(strand, shift, ref, read, segments)
         nearest = {
+            "strand": strand,
             "shift": shift,
             "total_edits": cost[0],
             "max_segment_edits": cost[1],
@@ -547,25 +609,44 @@ def _infeasible_envelope(
         )
     else:
         constraint_name = "per_segment_edit_budget"
-        reason = (
-            "No rotation admits exactly {k} non-empty consecutive segments "
-            "with each segment within {e} edit(s).".format(
-                k=copies, e=max_edits
+        if strand_mode == "auto":
+            reason = (
+                "No rotation of either strand of the reference admits exactly "
+                "{k} non-empty consecutive segments with each segment within "
+                "{e} edit(s).".format(k=copies, e=max_edits)
             )
-        )
+        elif strand_mode == "reverse":
+            reason = (
+                "No rotation of the reverse complement of the reference admits "
+                "exactly {k} non-empty consecutive segments with each segment "
+                "within {e} edit(s).".format(k=copies, e=max_edits)
+            )
+        else:
+            # Exact historical wording for the forward orientation.
+            reason = (
+                "No rotation admits exactly {k} non-empty consecutive segments "
+                "with each segment within {e} edit(s).".format(
+                    k=copies, e=max_edits
+                )
+            )
 
+    constraint = {
+        "name": constraint_name,
+        "copies": copies,
+        "max_edits_per_segment": max_edits,
+        "reference_length": len(reference),
+        "read_length": n,
+        "strand_mode": strand_mode,
+        "feasible_read_length": [min_total, max_total],
+    }
     return {
         "status": "infeasible",
         "error": "constraint_failed",
         "message": reason,
-        "constraint": {
-            "name": constraint_name,
-            "copies": copies,
-            "max_edits_per_segment": max_edits,
-            "reference_length": len(reference),
-            "read_length": n,
-            "feasible_read_length": [min_total, max_total],
+        "constraint": constraint,
+        "feasible_strands": {
+            name: [s for s, b in enumerate(shift_best) if b is not None]
+            for name, _, shift_best, _ in per_strand
         },
-        "feasible_shifts": [s for s, b in enumerate(shift_best) if b is not None],
         "nearest": nearest,
     }

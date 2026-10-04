@@ -4,7 +4,14 @@ import itertools
 
 import pytest
 
-from app.solver import align_global, rotate, solve, _replay
+from app.solver import (
+    align_global,
+    reverse_complement,
+    rotate,
+    solve,
+    _replay,
+    _witness_key,
+)
 
 
 # ---------------------------------------------------------------- alignments
@@ -201,6 +208,172 @@ def test_infeasible_random_garbage_still_locates():
     r = solve("ACGTACGTACGTACGTACGT", "Z" * 160, 8, 3)
     assert r["status"] == "infeasible"
     assert r["nearest"]["violating_segments"]
+
+
+# ----------------------------------------------------------------- strands
+
+
+def test_reverse_complement_helper():
+    assert reverse_complement("ACGT") == "ACGT"
+    assert reverse_complement("AACGCGTT") == "AACGCGTT"  # palindrome
+    assert reverse_complement("ACGTACGATC") == "GATCGTACGT"
+    # involution
+    seq = "ACGTACGATCA"
+    assert reverse_complement(reverse_complement(seq)) == seq
+
+
+def test_reverse_mode_decodes_reverse_complement_read():
+    ref = "ACGTACGATC"
+    rref = reverse_complement(ref)
+    assert rref != ref
+    r = solve(ref, rref * 3, 3, 0, "reverse")
+    assert r["status"] == "unique"
+    assert r["objective"] == {"total_edits": 0, "max_segment_edits": 0}
+    w = r["witness"]
+    assert w["strand"] == "reverse"
+    assert w["shift"] == 0
+    assert w["boundaries"] == [[0, 10], [10, 20], [20, 30]]
+    # CIGAR replays against the oriented (reverse-complement) reference.
+    for seg in w["segments"]:
+        assert seg["reference"] == rref
+        view = _replay(seg["reference"], seg["read"], seg["cigar"])
+        assert view["aligned_reference"].replace("-", "") == rref
+
+
+def test_reverse_mode_shift_is_relative_to_reverse_complement():
+    ref = "ACGTACGATC"
+    rref = reverse_complement(ref)
+    rrot = rotate(rref, 4)
+    r = solve(ref, rrot * 4, 4, 0, "reverse")
+    assert r["status"] == "unique"
+    w = r["witness"]
+    assert w["strand"] == "reverse"
+    assert w["shift"] == 4
+    assert w["segments"][0]["reference"] == rrot
+
+
+def test_reverse_mode_equivalent_to_forward_on_complement():
+    ref = "ACGTACGATC"
+    rref = reverse_complement(ref)
+    read = rotate(rref, 3) * 3
+    rev = solve(ref, read, 3, 1, "reverse")
+    direct = solve(rref, read, 3, 1, "forward")
+    assert rev["status"] == direct["status"] == "unique"
+    assert rev["objective"] == direct["objective"]
+    rw, dw = rev["witness"], direct["witness"]
+    assert rw["shift"] == dw["shift"]
+    assert rw["boundaries"] == dw["boundaries"]
+    assert [s["cigar"] for s in rw["segments"]] == [
+        s["cigar"] for s in dw["segments"]
+    ]
+
+
+def test_reverse_mode_rejects_forward_only_read():
+    ref = "ACGTACGATC"
+    # A clean forward read must not be decodable in strict reverse mode at
+    # cap 0 for a non-palindromic reference.
+    r = solve(ref, ref * 3, 3, 0, "reverse")
+    assert r["status"] == "infeasible"
+
+
+def test_auto_picks_reverse_when_only_reverse_feasible():
+    ref = "ACGTACGATC"
+    read = reverse_complement(ref) * 3
+    forward = solve(ref, read, 3, 0, "forward")
+    assert forward["status"] == "infeasible"
+    a = solve(ref, read, 3, 0, "auto")
+    assert a["status"] == "unique"
+    assert a["witness"]["strand"] == "reverse"
+
+
+def test_auto_picks_forward_when_only_forward_feasible():
+    ref = "ACGTACGATC"
+    a = solve(ref, ref * 3, 3, 0, "auto")
+    assert a["status"] == "unique"
+    assert a["witness"]["strand"] == "forward"
+
+
+def test_auto_does_not_privilege_first_computed_direction():
+    # A read that only fits the reverse strand: forward is evaluated first but
+    # auto must still return the reverse optimum rather than failing or
+    # preferring forward.
+    ref = "ACGTACGATC"
+    rrot = rotate(reverse_complement(ref), 2)
+    read = rrot * 3
+    a = solve(ref, read, 3, 0, "auto")
+    assert a["status"] == "unique"
+    assert a["witness"]["strand"] == "reverse"
+    assert a["witness"]["shift"] == 2
+
+
+def test_auto_cross_strand_tie_is_ambiguous_and_stable():
+    # A non-periodic reverse-complement palindrome: forward and reverse
+    # orientations are identical, so a perfect read has one optimum per
+    # strand and the cross-strand tie must be reported as ambiguous.
+    pal = "AACGCGTT"
+    assert reverse_complement(pal) == pal
+    a = solve(pal, pal * 3, 3, 0, "auto")
+    assert a["status"] == "ambiguous"
+    assert len(a["witnesses"]) == 2
+    assert a["more_witnesses"] is False
+    strands = [w["strand"] for w in a["witnesses"]]
+    assert strands == ["forward", "reverse"]
+    wf, wr = a["witnesses"]
+    assert wf["shift"] == wr["shift"] == 0
+    assert wf["boundaries"] == wr["boundaries"]
+    # Stable ordering: (strand, shift, boundaries, cigar).
+    assert _witness_key(wf) < _witness_key(wr)
+
+
+def test_cross_strand_ordering_key():
+    # Homopolymer is a palindrome and internally periodic: many (strand,
+    # shift) optima exist; ordering must lead with strand.
+    a = solve("AAAAAAAA", "A" * 24, 3, 0, "auto")
+    assert a["status"] == "ambiguous"
+    w0, w1 = a["witnesses"]
+    assert (w0["strand"], w0["shift"]) <= (w1["strand"], w1["shift"])
+    assert w0["strand"] == "forward"
+    assert a["more_witnesses"] is True
+
+
+def test_auto_both_strands_infeasible_is_locatable():
+    ref = "ACGTACGATC"
+    bad = "TTGTACGATC" + ref * 2  # two substitutions in the first forward copy
+    a = solve(ref, bad, 3, 1, "auto")
+    assert a["status"] == "infeasible"
+    assert a["error"] == "constraint_failed"
+    assert a["constraint"]["strand_mode"] == "auto"
+    assert set(a["feasible_strands"]) == {"forward", "reverse"}
+    assert a["feasible_strands"] == {"forward": [], "reverse": []}
+    nearest = a["nearest"]
+    assert nearest is not None
+    assert nearest["strand"] in ("forward", "reverse")
+    assert nearest["violating_segments"]
+
+
+def test_reverse_infeasible_envelope_is_strand_labelled():
+    ref = "ACGTACGATC"
+    r = solve(ref, ref * 3, 3, 1, "reverse")
+    assert r["status"] == "infeasible"
+    assert "feasible_strands" in r and "feasible_shifts" not in r
+    assert set(r["feasible_strands"]) == {"reverse"}
+    if r["nearest"] is not None:
+        assert r["nearest"]["strand"] == "reverse"
+
+
+def test_forward_envelope_is_strand_labelled():
+    # The solver always returns a uniform strand-aware envelope; collapsing it
+    # to the historical HTTP shape (for an omitted strand_mode) is the API's
+    # responsibility.
+    ref = "ACGTACGATC"
+    bad = "TTGTACGATC" + ref * 2
+    omitted = solve(ref, bad, 3, 1)
+    explicit = solve(ref, bad, 3, 1, "forward")
+    assert omitted == explicit
+    assert omitted["constraint"]["strand_mode"] == "forward"
+    assert set(omitted["feasible_strands"]) == {"forward"}
+    assert omitted["feasible_strands"]["forward"] == []
+    assert omitted["nearest"]["strand"] == "forward"
 
 
 # ------------------------------------------------------- brute-force agreement

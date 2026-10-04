@@ -8,7 +8,10 @@ It performs, in order, exiting non-zero on the first failure:
 3. sanity-check the running build (importable app + dependency versions),
 4. run a decode smoke test against the live API that exercises
    insertions, deletions and substitutions together, plus unique,
-   ambiguous and infeasible responses.
+   ambiguous and infeasible responses;
+5. exercise strand_mode: a reverse-complement read decoded in forward and
+   reverse, an auto request whose direction is uniquely determined, and a
+   cross-strand tie that must come back ambiguous.
 """
 
 from __future__ import annotations
@@ -82,6 +85,11 @@ def check_build() -> bool:
         return False
     print("build sanity check passed")
     return True
+
+
+def reverse_complement(seq: str) -> str:
+    table = str.maketrans("ACGT", "TGCA")
+    return seq.translate(table)[::-1]
 
 
 def post(payload: dict):
@@ -189,6 +197,120 @@ def smoke_decode() -> bool:
     return True
 
 
+def smoke_strands() -> bool:
+    step("strand_mode smoke (forward / reverse / auto + cross-strand tie)")
+
+    ref = "ACGTACGATC"
+    rref = reverse_complement(ref)
+    assert rref == "GATCGTACGT"
+
+    # Strict forward cannot explain a clean reverse-complement read at cap 0.
+    status, data = post(
+        {
+            "reference": ref,
+            "read": rref * 3,
+            "copies": 3,
+            "max_edits": 0,
+            "strand_mode": "forward",
+        }
+    )
+    if status != 422 or data.get("status") != "infeasible":
+        print("FAIL: reverse-complement read must be infeasible in forward", status)
+        return False
+    print("forward rejects reverse-complement read (422 infeasible)")
+
+    # Reverse mode decodes it uniquely with strand == reverse.
+    status, data = post(
+        {
+            "reference": ref,
+            "read": rref * 3,
+            "copies": 3,
+            "max_edits": 0,
+            "strand_mode": "reverse",
+        }
+    )
+    if status != 200 or data["status"] != "unique":
+        print("FAIL: reverse mode should decode", status, data.get("status"))
+        return False
+    witness = data["witness"]
+    if witness["strand"] != "reverse" or witness["shift"] != 0:
+        print("FAIL: unexpected reverse witness", witness.get("strand"), witness.get("shift"))
+        return False
+    if data["rotated_reference"] != rref:
+        print("FAIL: oriented reference mismatch", data["rotated_reference"])
+        return False
+    # The CIGAR must replay directly against the oriented reference/read.
+    seg = witness["segments"][0]
+    if seg["aligned_reference"] != seg["aligned_read"] or seg["aligned_reference"].replace("-", "") != rref:
+        print("FAIL: reverse replay mismatch")
+        return False
+    print("reverse decodes uniquely; CIGAR replays against oriented reference")
+
+    # Auto must determine the direction as reverse (never prefer the
+    # first-computed forward direction).
+    status, data = post(
+        {
+            "reference": ref,
+            "read": rref * 3,
+            "copies": 3,
+            "max_edits": 0,
+            "strand_mode": "auto",
+        }
+    )
+    if status != 200 or data["status"] != "unique":
+        print("FAIL: auto should resolve uniquely", status, data.get("status"))
+        return False
+    if data["witness"]["strand"] != "reverse":
+        print("FAIL: auto picked the wrong direction", data["witness"].get("strand"))
+        return False
+    print("auto determines direction = reverse")
+
+    # Cross-strand tie: a non-periodic reverse-complement palindrome gives an
+    # equal optimum in both directions, which must be reported ambiguous.
+    pal = "AACGTACGTT"
+    assert reverse_complement(pal) == pal and len(pal) == 10
+    status, data = post(
+        {
+            "reference": pal,
+            "read": pal * 3,
+            "copies": 3,
+            "max_edits": 0,
+            "strand_mode": "auto",
+        }
+    )
+    if status != 200 or data["status"] != "ambiguous":
+        print("FAIL: cross-strand tie must be ambiguous", status, data.get("status"))
+        return False
+    strands = [w["strand"] for w in data["witnesses"]]
+    if strands != ["forward", "reverse"]:
+        print("FAIL: witnesses must be ordered forward then reverse", strands)
+        return False
+    if data.get("more_witnesses") is not False:
+        print("FAIL: exactly two cross-strand witnesses expected")
+        return False
+    print("cross-strand tie reported ambiguous, stably ordered forward/reverse")
+
+    # An illegal strand_mode is a field-validation rejection, not a decode.
+    status, data = post(
+        {
+            "reference": ref,
+            "read": rref * 3,
+            "copies": 3,
+            "max_edits": 0,
+            "strand_mode": "backwards",
+        }
+    )
+    if status != 422 or data.get("status") == "infeasible":
+        print("FAIL: illegal strand_mode must be a field 422", status)
+        return False
+    locs = [tuple(err.get("loc", [])) for err in data.get("detail", [])]
+    if ("body", "strand_mode") not in locs:
+        print("FAIL: field error must point at strand_mode", locs)
+        return False
+    print("illegal strand_mode rejected as a field error")
+    return True
+
+
 def main() -> int:
     if not wait_for_health():
         return 1
@@ -197,6 +319,8 @@ def main() -> int:
     if not check_build():
         return 1
     if not smoke_decode():
+        return 1
+    if not smoke_strands():
         return 1
     print("\n=== verify: ALL CHECKS PASSED ===")
     return 0
